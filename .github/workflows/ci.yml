@@ -51,7 +51,7 @@ jobs:
       - name: Image starts and answers
         run: |
           docker run -d --name bg -p 8080:8080 -e PREDICTION_SINK=jsonl:/tmp/p.jsonl batchguard:ci
-          for i in $(seq 1 30); do curl -fs localhost:8080/healthz && break; sleep 1; done
+          for i in $(seq 1 30); do curl -fs localhost:8080/health && break; sleep 1; done
           pip install -q requests numpy
           PYTHONPATH=src python -m batchguard.oq --url http://localhost:8080 --expect-version ci
           docker rm -f bg
