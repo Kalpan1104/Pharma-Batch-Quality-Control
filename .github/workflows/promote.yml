@@ -1,0 +1,125 @@
+name: Promote
+
+# Release the current candidate: approval (GitHub Environment "production") -> canary -> verify -> 100%.
+on:
+  workflow_dispatch:
+    inputs:
+      canary_percent:
+        description: "Share of traffic for the canary"
+        default: "10"
+      canary_minutes:
+        description: "How long to watch the canary before going to 100%"
+        default: "5"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: traffic
+  cancel-in-progress: false
+
+env:
+  REGION: ${{ vars.GCP_REGION }}
+  SERVICE: ${{ vars.SERVICE_NAME }}
+  AUDIT_SINK: bigquery:${{ vars.AUDIT_TABLE }}
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    environment: production          # pauses here until a required reviewer approves
+    outputs:
+      candidate: ${{ steps.state.outputs.candidate }}
+      stable: ${{ steps.state.outputs.stable }}
+      url: ${{ steps.state.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -r requirements.txt && pip install --no-deps -e .
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOYER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Current state
+        id: state
+        run: |
+          gcloud run services describe "$SERVICE" --region="$REGION" --format=json > service.json
+          CANDIDATE=$(python -m batchguard.traffic tagged candidate < service.json)
+          STABLE=$(python -m batchguard.traffic serving < service.json)
+          [ -n "$CANDIDATE" ] || { echo "::error::No candidate revision. Run the Release candidate workflow first."; exit 1; }
+          [ "$CANDIDATE" != "$STABLE" ] || { echo "::error::$CANDIDATE is already serving."; exit 1; }
+          echo "candidate=$CANDIDATE" >> "$GITHUB_OUTPUT"
+          echo "stable=$STABLE" >> "$GITHUB_OUTPUT"
+          echo "url=$(python -m batchguard.traffic url candidate < service.json)" >> "$GITHUB_OUTPUT"
+      - name: Start canary
+        run: |
+          gcloud run services update-traffic "$SERVICE" --region="$REGION" --to-tags="candidate=${{ inputs.canary_percent }}"
+          python -m batchguard.audit record --event canary_started --revision "${{ steps.state.outputs.candidate }}" \
+            --detail previous_revision="${{ steps.state.outputs.stable }}" --detail percent="${{ inputs.canary_percent }}" \
+            --detail approval="GitHub environment 'production'"
+          echo "### Canary: ${{ inputs.canary_percent }}% to \`${{ steps.state.outputs.candidate }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    needs: canary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -r requirements.txt && pip install --no-deps -e .
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOYER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Watch the canary
+        run: sleep $(( ${{ inputs.canary_minutes }} * 60 ))
+      - name: No errors logged by the canary revision
+        run: |
+          ERRORS=$(gcloud logging read \
+            "resource.type=\"cloud_run_revision\" AND resource.labels.revision_name=\"${{ needs.canary.outputs.candidate }}\" AND severity>=ERROR" \
+            --freshness="$(( ${{ inputs.canary_minutes }} + 10 ))m" --limit=20 --format="value(timestamp)" | wc -l)
+          echo "errors logged by canary: $ERRORS"
+          [ "$ERRORS" -eq 0 ]
+      - id: idtoken
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOYER_SA }}
+          token_format: id_token
+          id_token_audience: ${{ vars.SERVICE_NAME }}
+          id_token_include_email: true
+      - name: OQ again while serving live traffic
+        run: python -m batchguard.oq --url "${{ needs.canary.outputs.url }}" --token "${{ steps.idtoken.outputs.id_token }}" --out oq_canary.json
+      - name: Abort canary on failure
+        if: failure()
+        run: |
+          gcloud run services update-traffic "$SERVICE" --region="$REGION" --to-revisions="${{ needs.canary.outputs.stable }}=100"
+          python -m batchguard.audit record --event canary_failed --revision "${{ needs.canary.outputs.candidate }}" \
+            --detail restored_revision="${{ needs.canary.outputs.stable }}"
+          echo "### ❌ Canary failed; all traffic restored to \`${{ needs.canary.outputs.stable }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  full:
+    needs: [canary, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -r requirements.txt && pip install --no-deps -e .
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOYER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: 100% to the candidate, and point the monitoring job at the same image
+        run: |
+          CAND="${{ needs.canary.outputs.candidate }}"
+          gcloud run services update-traffic "$SERVICE" --region="$REGION" --to-revisions="$CAND=100"
+          IMAGE=$(gcloud run revisions describe "$CAND" --region="$REGION" --format='value(spec.containers[0].image)')
+          gcloud run jobs update "${SERVICE}-monitor" --region="$REGION" --image="$IMAGE" --quiet
+          python -m batchguard.audit record --event promoted --revision "$CAND" --image "$IMAGE" \
+            --detail previous_revision="${{ needs.canary.outputs.stable }}"
+          echo "### ✅ \`$CAND\` now serves 100% of traffic (previous: \`${{ needs.canary.outputs.stable }}\`)" >> "$GITHUB_STEP_SUMMARY"

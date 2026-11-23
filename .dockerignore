@@ -1,0 +1,17 @@
+.git
+.github
+.venv
+**/__pycache__
+.pytest_cache
+.ruff_cache
+artifacts*
+logs
+reports
+infra
+tests
+docs
+*.md
+# training and acceptance data are regenerated deterministically inside the build;
+# only an optional recent-batches file is sent in
+data/*.jsonl
+!data/recent.jsonl

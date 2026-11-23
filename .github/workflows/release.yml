@@ -1,0 +1,137 @@
+name: Release candidate
+
+# Builds an image (training + validation happen inside the build), pushes it, deploys it as a
+# Cloud Run revision with NO traffic under the "candidate" tag, and runs operational qualification
+# against it. Nothing reaches users until the Promote workflow is approved.
+on:
+  push:
+    branches: [main]
+    paths: ["src/**", "Dockerfile", "requirements.txt"]
+  workflow_dispatch:
+    inputs:
+      recent:
+        description: "Add labelled recent batches from a scenario before training"
+        type: choice
+        options: [none, new_supplier]
+        default: none
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: vars.WIF_PROVIDER != ''
+    runs-on: ubuntu-latest
+    env:
+      REGION: ${{ vars.GCP_REGION }}
+      SERVICE: ${{ vars.SERVICE_NAME }}
+      AUDIT_SINK: bigquery:${{ vars.AUDIT_TABLE }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt && pip install --no-deps -e .
+
+      - name: Version and optional recent data
+        id: v
+        run: |
+          VERSION="${GITHUB_SHA::12}"
+          TRAIN_ARGS=""
+          if [ "${{ inputs.recent }}" = "new_supplier" ]; then
+            python -m batchguard.data --recent new_supplier
+            TRAIN_ARGS="--recent data/recent.jsonl"
+            VERSION="${VERSION}-r${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "train_args=$TRAIN_ARGS" >> "$GITHUB_OUTPUT"
+          echo "image=${{ vars.IMAGE_REPO }}/batchguard:$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOYER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build (fails here if any acceptance criterion fails)
+        run: |
+          docker build -t "${{ steps.v.outputs.image }}" \
+            --build-arg MODEL_VERSION="${{ steps.v.outputs.version }}" \
+            --build-arg GIT_SHA="$GITHUB_SHA" \
+            --build-arg TRAIN_ARGS="${{ steps.v.outputs.train_args }}" .
+
+      - name: Extract the validation report from the image
+        run: |
+          id=$(docker create "${{ steps.v.outputs.image }}")
+          docker cp "$id:/app/artifacts" release-artifacts
+          docker rm "$id"
+          cat release-artifacts/validation_report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push
+        id: push
+        run: |
+          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+          docker push "${{ steps.v.outputs.image }}"
+          echo "digest=$(docker inspect --format='{{index .RepoDigests 0}}' "${{ steps.v.outputs.image }}")" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy as candidate (0% traffic)
+        id: deploy
+        run: |
+          gcloud run deploy "$SERVICE" --region="$REGION" --image="${{ steps.push.outputs.digest }}" \
+            --no-traffic --tag=candidate --service-account="${{ vars.RUNTIME_SA }}" \
+            --set-env-vars="PREDICTION_SINK=bigquery:${{ vars.PREDICTIONS_TABLE }},REPORTS_URI=${{ vars.REPORTS_URI }}" \
+            --memory=1Gi --cpu=1 --min-instances=0 --max-instances=3 --no-allow-unauthenticated --quiet
+          gcloud run services describe "$SERVICE" --region="$REGION" --format=json > service.json
+          echo "revision=$(python -m batchguard.traffic tagged candidate < service.json)" >> "$GITHUB_OUTPUT"
+          echo "url=$(python -m batchguard.traffic url candidate < service.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Audit - candidate deployed
+        run: |
+          python -m batchguard.audit record --event candidate_deployed \
+            --revision "${{ steps.deploy.outputs.revision }}" --image "${{ steps.push.outputs.digest }}" \
+            --model-version "${{ steps.v.outputs.version }}" --details-file release-artifacts/metrics.json
+
+      - id: idtoken
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOYER_SA }}
+          token_format: id_token
+          id_token_audience: ${{ vars.SERVICE_NAME }}
+          id_token_include_email: true
+
+      - name: Operational qualification against the candidate
+        run: |
+          python -m batchguard.oq --url "${{ steps.deploy.outputs.url }}" --token "${{ steps.idtoken.outputs.id_token }}" \
+            --expect-version "${{ steps.v.outputs.version }}" --out oq_results.json
+
+      - name: Audit - OQ result
+        if: always() && steps.deploy.outcome == 'success'
+        run: |
+          EVENT=oq_passed; [ "${{ job.status }}" = "success" ] || EVENT=oq_failed
+          python -m batchguard.audit record --event "$EVENT" --revision "${{ steps.deploy.outputs.revision }}" \
+            --image "${{ steps.push.outputs.digest }}" --model-version "${{ steps.v.outputs.version }}" \
+            --details-file oq_results.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-${{ steps.v.outputs.version }}
+          path: |
+            release-artifacts/
+            oq_results.json
+          retention-days: 90
+
+      - name: Next step
+        run: |
+          {
+            echo "### Candidate \`${{ steps.deploy.outputs.revision }}\` is deployed with 0% traffic and passed OQ."
+            echo "Candidate URL: ${{ steps.deploy.outputs.url }}"
+            echo "To release it: **Actions → Promote → Run workflow** (requires approval)."
+          } >> "$GITHUB_STEP_SUMMARY"

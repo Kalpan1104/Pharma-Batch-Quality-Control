@@ -1,0 +1,48 @@
+name: Rollback
+
+# Emergency rollback: no approval needed, but every rollback is written to the audit log.
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Revision to restore (leave empty for the one that served before the last promotion)"
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: traffic
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    env:
+      REGION: ${{ vars.GCP_REGION }}
+      SERVICE: ${{ vars.SERVICE_NAME }}
+      AUDIT_SINK: bigquery:${{ vars.AUDIT_TABLE }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -r requirements.txt && pip install --no-deps -e .
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOYER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Restore
+        run: |
+          TARGET="${{ inputs.revision }}"
+          [ -n "$TARGET" ] || TARGET=$(python -m batchguard.audit last --event promoted --field details.previous_revision)
+          [ -n "$TARGET" ] || { echo "::error::No previous revision found; pass one explicitly."; exit 1; }
+          gcloud run services describe "$SERVICE" --region="$REGION" --format=json > service.json
+          CURRENT=$(python -m batchguard.traffic serving < service.json)
+          gcloud run services update-traffic "$SERVICE" --region="$REGION" --to-revisions="$TARGET=100"
+          IMAGE=$(gcloud run revisions describe "$TARGET" --region="$REGION" --format='value(spec.containers[0].image)')
+          gcloud run jobs update "${SERVICE}-monitor" --region="$REGION" --image="$IMAGE" --quiet
+          python -m batchguard.audit record --event rolled_back --revision "$TARGET" --image "$IMAGE" \
+            --detail from_revision="$CURRENT"
+          echo "### ↩️ \`$TARGET\` restored to 100% (was \`$CURRENT\`)" >> "$GITHUB_STEP_SUMMARY"

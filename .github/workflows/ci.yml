@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt && pip install --no-deps -e .
+      - name: Lint
+        run: ruff check src tests scripts
+      - name: Unit, contract, parity and OQ tests
+        run: pytest
+      - name: Train + acceptance criteria (fails the PR if the model would not be releasable)
+        run: python -m batchguard.train --out artifacts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: validation-report
+          path: artifacts/validation_report.md
+
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Format (advisory)
+        run: terraform fmt -check -diff || echo "::warning::Run 'terraform fmt' in infra/terraform"
+      - run: terraform init -backend=false
+      - name: Validate
+        run: terraform validate
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (trains and validates inside the build)
+        run: docker build -t batchguard:ci --build-arg MODEL_VERSION=ci --build-arg GIT_SHA="$GITHUB_SHA" .
+      - name: Image starts and answers
+        run: |
+          docker run -d --name bg -p 8080:8080 -e PREDICTION_SINK=jsonl:/tmp/p.jsonl batchguard:ci
+          for i in $(seq 1 30); do curl -fs localhost:8080/healthz && break; sleep 1; done
+          pip install -q requests numpy
+          PYTHONPATH=src python -m batchguard.oq --url http://localhost:8080 --expect-version ci
+          docker rm -f bg
