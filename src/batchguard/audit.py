@@ -11,6 +11,7 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from batchguard import config as C
 from batchguard.sinks import open_sink
@@ -54,7 +55,7 @@ def main(argv=None):
     if a.cmd == "record":
         details = dict(kv.split("=", 1) for kv in a.detail)
         if a.details_file:
-            details.update(json.loads(open(a.details_file).read()))
+            details.update(json.loads(Path(a.details_file).read_text()))
         entry = record(a.event, revision=a.revision, image=a.image, model_version=a.model_version,
                        actor=a.actor or None, details=details)
         print(json.dumps(entry))

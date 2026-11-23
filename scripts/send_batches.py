@@ -14,9 +14,8 @@ from collections import Counter
 
 import requests
 
-sys.path.insert(0, "src")
-from batchguard import config as C  # noqa: E402
-from batchguard.data import generate  # noqa: E402
+from batchguard import config as C
+from batchguard.data import generate
 
 
 def gcloud(*args):

@@ -22,7 +22,8 @@ SEED = 7
 def build_pipeline(numeric):
     pre = ColumnTransformer([
         ("num", "passthrough", numeric),
-        ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), CATEGORICAL),
+                ("cat", OneHotEncoder(categories=[C.LINES, C.SHIFTS, [*C.KNOWN_SUPPLIERS, "SupD", "other"]],
+                              handle_unknown="ignore", sparse_output=False), CATEGORICAL),
     ])
     clf = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, max_leaf_nodes=15,
                                          l2_regularization=1.0, random_state=SEED)
@@ -77,13 +78,13 @@ def explain(bundle, X, top=3):
 
 def evaluate(bundle, batches):
     y = np.array([b[C.TARGET] for b in batches])
-    p, X = predict_risk(bundle, batches)
+    p, _ = predict_risk(bundle, batches)
     hold = p >= bundle["threshold"]
     lines = np.array([b["line"] for b in batches])
     line_recall = {ln: round(float(recall_score(y[lines == ln], hold[lines == ln], zero_division=0)), 4)
                    for ln in C.LINES if (y[lines == ln] == 1).any()}
     return {
-        "n": int(len(y)), "failure_rate": round(float(y.mean()), 4),
+        "n": len(y), "failure_rate": round(float(y.mean()), 4),
         "auc": round(float(roc_auc_score(y, p)), 4),
         "recall": round(float(recall_score(y, hold, zero_division=0)), 4),
         "precision": round(float(precision_score(y, hold, zero_division=0)), 4),
