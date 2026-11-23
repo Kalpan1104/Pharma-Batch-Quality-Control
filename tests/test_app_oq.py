@@ -26,7 +26,7 @@ def call_with(client):
 
 
 def test_health(client):
-    assert client.get("/healthz").get_json()["model_version"] == "test-v1"
+    assert client.get("/health").get_json()["model_version"] == "test-v1"
 
 
 def test_predict_and_log(client, unlabeled, tmp_path):

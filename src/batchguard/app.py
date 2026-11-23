@@ -1,7 +1,7 @@
 """
 BatchGuard API (Flask), served by gunicorn on Cloud Run.
 
-    GET  /healthz        liveness + which model this revision serves
+    GET  /health         liveness + which model this revision serves
     GET  /v1/model       model identity and its acceptance results
     POST /v1/predict     {"batches": [...]} -> risk, decision, top factors
 
@@ -42,7 +42,7 @@ def create_app(model_path=None, sink=None):
     app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
     log("INFO", "model loaded", model_version=identity["model_version"], revision=revision)
 
-    @app.get("/healthz")
+    @app.get("/health")
     def healthz():
         return jsonify(status="ok", model_version=identity["model_version"], revision=revision,
                        threshold=round(bundle["threshold"], 4))

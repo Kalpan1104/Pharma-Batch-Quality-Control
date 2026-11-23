@@ -557,10 +557,10 @@ URL=$(make -s url)
 TOKEN=$(gcloud auth print-identity-token)
 ```
 
-### `GET /healthz`
+### `GET /health`
 
 ```bash
-curl -s -H "Authorization: Bearer $TOKEN" "$URL/healthz"
+curl -s -H "Authorization: Bearer $TOKEN" "$URL/health"
 ```
 
 ```json

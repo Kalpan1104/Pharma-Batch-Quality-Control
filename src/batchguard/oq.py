@@ -43,7 +43,7 @@ def run(call, expect_version=None, latency_requests=20, max_p95_ms=1500):
     def check(cid, desc, ok, detail=""):
         checks.append({"id": cid, "check": desc, "passed": bool(ok), "detail": detail})
 
-    status, body = call("GET", "/healthz", None)
+    status, body = call("GET", "/health", None)
     check("OQ-1", "Health endpoint responds", status == 200 and body.get("status") == "ok", body)
     if expect_version:
         check("OQ-2", f"Serves the expected model version ({expect_version})",

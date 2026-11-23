@@ -54,7 +54,7 @@ url:             ## service URL
 	@gcloud run services describe $(SERVICE) --region=$(REGION) --format='value(status.url)'
 
 health:          ## call /healthz on the live service
-	@curl -s -H "Authorization: Bearer $$(gcloud auth print-identity-token)" "$$(gcloud run services describe $(SERVICE) --region=$(REGION) --format='value(status.url)')/healthz"; echo
+	@curl -s -H "Authorization: Bearer $$(gcloud auth print-identity-token)" "$$(gcloud run services describe $(SERVICE) --region=$(REGION) --format='value(status.url)')/health"; echo
 
 traffic:         ## 300 normal batches to the live service
 	$(PY) scripts/send_batches.py --region $(REGION) --n 300
